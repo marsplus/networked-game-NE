@@ -241,7 +241,7 @@ class LQGame(Game):
             # torch.clamp(x, min=0, max=float('inf'))
             dist = self.check_quality(x.detach())
             L.append(dist.item())
-            print(f"Epoch: {epoch:04d} | Dist: {dist.item():.4f}")
+            # print(f"Epoch: {epoch:04d} | Dist: {dist.item():.4f}")
         return x.detach(), L
 
     

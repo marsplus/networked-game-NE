@@ -86,6 +86,7 @@ def GNN_para_BR(x_init):
     optimizer = optim.Adam(model.parameters(),
                        lr=args.lr, weight_decay=args.weight_decay)   
     adj_tensor = torch.tensor(adj, dtype=torch.float32)
+    model.train()
 
     ## optimize GNN every [alter_iter] iterations of the game's 
     ## best response updating
@@ -96,18 +97,22 @@ def GNN_para_BR(x_init):
         x_init, _ = LQG.grad_BR(maxIter=alter_iter, x_init=x_init, \
                                             elementwise=True, optimizer='Adam', projection=False)        
 
-        for _ in range(GNN_train_epochs):
-            model.train()
-            optimizer.zero_grad()
-            x_new = model(x_init.reshape(-1, 1), adj_tensor)
-            loss = LQG.regret(x_new.squeeze()).max()
-            loss.backward()
-            optimizer.step()
-            print(f"GNN loss: {loss.item():.4f}")
+        x_new = model(x_init.reshape(-1, 1), adj_tensor)
+        fixed_point_dist = torch.dist(x_new.detach().squeeze(), x_init)
+        print(f"Distance to be a fixed point: {fixed_point_dist:.4f}")
+        if fixed_point_dist > 1e-3:
+            for _ in range(GNN_train_epochs):
+                optimizer.zero_grad()
+                x_new = model(x_init.reshape(-1, 1), adj_tensor)
+                loss = LQG.regret(x_new.squeeze()).max()
+                loss.backward()
+                optimizer.step()
+                # print(f"GNN loss: {loss.item():.4f}")
         
         x_init = x_new.squeeze().detach()
         dist = torch.dist(x_init, x_ne)
+        print(f"Distance to be a NE: {dist:.4f}")
         L.append(dist.item())
-        
+    print()
 
 GNN_para_BR(x_init)
