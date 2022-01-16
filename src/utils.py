@@ -6,14 +6,30 @@ import torch
 from torch.autograd import Variable
 import torch.nn.functional as F
 
-def gen_graph(n, graphType, seed=123):
-    if graphType == 'BA':
+from networkx.algorithms.community import greedy_modularity_communities
+
+## extract community information into a matrix C
+## nonzero entries in the i-th row of C encode 
+## these players in community i
+def extract_community(G):
+    comms = list(greedy_modularity_communities(G))
+    num_comms = len(comms)
+    n = len(G)
+    C = np.zeros((num_comms, n))
+    for i in range(num_comms):
+        C[i, list(comms[i])] = 1
+    return C
+
+
+def gen_graph(n, graph, seed=123):
+    if graph == 'BA':
         G = nx.barabasi_albert_graph(n, 3, seed=seed)
-    elif graphType == 'SW':
+    elif graph == 'SW':
         G = nx.watts_strogatz_graph(n, 10, 0.2, seed=seed)
-    elif graphType == 'RG':
-        G = nx.random_geometric_graph(n, 0.2, seed=seed)
+    elif graph == 'RG':
+        G = nx.random_geometric_graph(n, 0.1, seed=seed)
     return G
+
 
 ## initialize action probability
 def gen_action_logprob(n, actionDim, seed=123):
@@ -22,6 +38,7 @@ def gen_action_logprob(n, actionDim, seed=123):
     action_prob /= action_prob.sum(axis=1)[:, np.newaxis]
     return torch.from_numpy(np.log(action_prob))   
 
+
 ## output the adjacency matrix and each player's strategy
 def gen_data(n, graphType, actionDim, seed=123):
     G = gen_graph(n, graphType, seed=seed)
@@ -29,6 +46,22 @@ def gen_data(n, graphType, actionDim, seed=123):
     action_prob = gen_action_logprob(n, actionDim)
     playerToNeigh = {i: torch.LongTensor(list(G.neighbors(i))) for i in range(len(G))}
     return sparse_mx_to_torch_sparse_tensor(adj), action_prob, playerToNeigh
+
+
+## generate the b vector in linear-quadratic games
+def gen_b(n, adj, mode='ind'):
+    ## no correlation 
+    if mode == 'ind':
+        b_vec = np.random.multivariate_normal(np.zeros(n), np.identity(n))
+    ## correlation of homophily
+    elif mode == 'homo':
+        L = np.diag(np.sum(np.array(adj), axis=0)) - adj
+        L_pinv = np.linalg.pinv(L, hermitian=True)
+        b_vec = np.random.multivariate_normal(np.zeros(n), L_pinv)
+    else:
+        raise ValueError("Unknow mode when generating b")
+    noise = np.random.multivariate_normal(np.zeros(n), np.identity(n)) * 0.1
+    return b_vec + noise
 
 
 ## sample from a gumbel distribution
@@ -79,3 +112,8 @@ def sparse_mx_to_torch_sparse_tensor(sparse_mx):
     values = torch.from_numpy(sparse_mx.data)
     shape = torch.Size(sparse_mx.shape)
     return torch.sparse.FloatTensor(indices, values, shape)
+
+
+## euclidean projection onto L2 ball
+def euclidean_proj_l2(origin, epsilon):
+    return origin / max(epsilon, np.linalg.norm(origin, 2))
