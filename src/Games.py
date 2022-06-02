@@ -4,9 +4,9 @@ from abc import ABC, abstractmethod
 
 import torch.optim as optim
 import torch.nn as nn
+from torch.autograd import Variable
 
 import cvxpy as cvx
-from utils import euclidean_proj_l2
 
 DTYPE = torch.float32
 
@@ -34,22 +34,48 @@ class Game(ABC):
 
 
 class LQGame(Game):
-    def __init__(self, n, b_vec, adj, beta, C, proj_tol=0.5):
-        sr = np.abs(np.linalg.eig(np.diag(beta * np.ones(n)) @ adj)[0]).max()
-        assert(sr < 1.0)
-        self.n   = n
-        self.b   = torch.tensor(b_vec, dtype=DTYPE)
-        self.adj = torch.tensor(adj, dtype=DTYPE)
-        self.beta= torch.tensor(beta, dtype=DTYPE)
-        self.x_ne= self.approx_NE()
+    def __init__(self, n, b_vec, adj, beta, M=None, N=None, lb=0.0, ub=1.0):
+        # sr = np.abs(np.linalg.eig(np.diag(beta * np.ones(n)) @ adj)[0]).max()
+        # ## whether the game has a unique NE
+        # self.unique_ne = True if sr < 1.0 else False
 
-        self.C = C
-        self.y_at_ne = self.C @ self.x_ne.numpy()
-        self.proj_tol = proj_tol
+        self.lb = lb
+        self.ub = ub
+            
+        self.n    = n
+        self.b    = torch.tensor(b_vec, dtype=DTYPE)
+        self.adj  = torch.tensor(adj, dtype=DTYPE)
+        ## make sure the diagonal items are zeros
+        self.adj -= torch.diag(torch.diag(self.adj))
+        self.beta = torch.tensor(beta, dtype=DTYPE)
 
-        self.adjList = {
-            i: torch.nonzero(self.adj[i, :]).squeeze().tolist() for i in range(self.n)
-        }
+        ## compute Laplacian matrix
+        self.laplacian = torch.diag(self.adj.sum(axis=0)) - self.adj
+
+        ## group membership information
+        if (M is not None) and (N is not None):
+            self.M = torch.tensor(M, dtype=DTYPE)
+            self.N = torch.tensor(N, dtype=DTYPE)
+
+        # if self.unique_ne: 
+        #     self.x_ne  = self.approx_NE()
+
+        
+        self.adjList = {}
+        for i in range(self.n):
+            adjlist = torch.nonzero(self.adj[i, :]).squeeze().tolist() 
+            if type(adjlist) is list:
+                self.adjList[i] = adjlist
+            else:
+                self.adjList[i] = [adjlist]
+
+
+    ## check the computation of gradients
+    def check_gradient(self, x, grad):
+        grad_true = self.b - x + torch.diag(self.beta * torch.ones(self.n)) @ ( self.adj @ x )
+        dist = torch.dist(torch.abs(grad_true), torch.abs(grad))
+        print(f"Gradient difference: {dist:.8f}")
+
 
     ## output a vector of utilities
     def utility(self, x):
@@ -73,14 +99,25 @@ class LQGame(Game):
     ## approx. NE
     def approx_NE(self):
         beta = self.beta * torch.ones(self.n)
-        A = torch.eye(self.n) - torch.diag(beta) @ self.adj
-        x_ne, _ = torch.solve(self.b.reshape(-1, 1), A)
+        A    = torch.eye(self.n) - torch.diag(beta) @ self.adj
+        x_ne = torch.linalg.solve(A, self.b.reshape(-1, 1))
+        # x_ne, _ = torch.solve(self.b.reshape(-1, 1), A)
+        x_ne.clamp_(self.lb, self.ub)
         return x_ne.squeeze()
 
 
+    ## compute gradient map
+    def compute_grad(self, xt):
+        beta = self.beta * torch.ones(self.n)
+        grad = self.b - xt + torch.diag(beta) @ self.adj @ xt
+        return grad
+
+
     def check_quality(self, x):
-        dist = torch.dist(self.x_ne, x)
-        return dist
+        # if self.unique_ne:
+        #     return torch.dist(self.x_ne, x)
+        # else:
+        return self.regret(x).max()
 
 
     ## output a vector of regrets
@@ -95,12 +132,15 @@ class LQGame(Game):
     def regret_(self, x, i):
         x_opt = x.clone()
         x_opt[i] = self.best_response_(x, i)
-        return self.utility_(x_opt, i) - self.utility_(x, i)    
+        rt = self.utility_(x_opt, i) - self.utility_(x, i)    
+        assert(rt >= 0.0 or torch.abs(rt) <= 1e-5)
+        return rt
 
 
     ## output a vector of best responses
     def best_response(self, x):
         x_ = self.b + torch.diag(self.beta * torch.ones(self.n)) @ self.adj @ x
+        x_.clamp_(self.lb, self.ub)
         return x_
 
 
@@ -108,6 +148,7 @@ class LQGame(Game):
     def best_response_(self, x, i):
         beta = self.beta * torch.ones(self.n)
         x_ = self.b[i] + beta[i] * torch.dot(self.adj[i, :], x)
+        x_.clamp_(self.lb, self.ub)
         return x_
 
 
@@ -115,49 +156,47 @@ class LQGame(Game):
     ## Vickrey&Koller, AAAI02
     ###########################################################################
     def compute_G_(self, x, i, nIter=3):
-        from torch.autograd import Variable
         x_ = x.clone()
         neigh_effect = torch.dot(self.adj[i, :], x_)
         beta = self.beta * torch.ones(self.n)
-        r_orig = self.regret(x_)
+        r_old = self.regret(x_, lb=float('-inf'), ub=float('inf'))
+
         ## temporarily used for differentiation
-        utility_ = lambda x, i, neffect: self.b[i] * x - 0.5 * x ** 2 + beta[i] * x * neffect
+        utility_ = lambda x_i, i, neffect: self.b[i] * x_i - 0.5 * x_i ** 2 + beta[i] * x_i * neffect
 
         ## compute i's best response
-        x_opt = self.b[i] + beta[i] * neigh_effect
+        i_opt = self.b[i] + beta[i] * neigh_effect
 
         y = Variable(torch.rand_like(x[i]), requires_grad=True)
         optimizer = optim.LBFGS([y], lr=0.01, history_size=30, max_iter=15, line_search_fn="strong_wolfe")
 
         ## the objective function to minimize
         def f(y):
-            r_ = r_orig.clone()
+            x_[i] = y
+            r_ = r_old.clone()
             ## i's regret
-            r_[i] = utility_(x_opt, i, neigh_effect) - utility_(y, i, neigh_effect) 
+            r_[i] = utility_(i_opt, i, neigh_effect) - utility_(y, i, neigh_effect) 
 
             ## i's neighbors regret
-            x_tmp = x.clone()
-            x_tmp[i] = y
             for j in self.adjList[i]:
-                n_effect = torch.dot(self.adj[j, :], x_tmp)
-                y_opt = self.b[j] + beta[j] * n_effect
+                n_effect = torch.dot(self.adj[j, :], x_)
+                j_opt = self.b[j] + beta[j] * n_effect
                 ## j's regret
-                r_[j] = utility_(y_opt, j, n_effect) - utility_(x_tmp[j], j, n_effect)
+                r_[j] = utility_(j_opt, j, n_effect) - utility_(x_[j], j, n_effect)
             
-            return -(r_orig.sum() - r_.sum())
+            return -(r_old.sum() - r_.sum())
             
         for _ in range(nIter):
             optimizer.zero_grad()
             obj = f(y)
-            obj.backward()
+            obj.backward(retain_graph=True)
             # print("obj: ", obj.item())
             optimizer.step(lambda: f(y))
 
-        # y.detach().clamp_(min=0, max=float('inf'))
         return y.item(), -f(y).item()
 
 
-    def regretMIN(self, x, maxIter=1500):
+    def regretMIN(self, x, maxIter=1500, lb=0, ub=1):
         ## initialize the G vector
         G  = torch.zeros(self.n)
         x_ = torch.zeros(self.n)
@@ -166,7 +205,7 @@ class LQGame(Game):
             
         x_opt = x.clone()
         Iter = 0
-        L = []
+        L = [self.check_quality(x_opt)]
         while True:
             if Iter >= maxIter:
                 break
@@ -175,39 +214,47 @@ class LQGame(Game):
             if G[idx] <= 0:
                 break
             else:
-                Iter += 1
                 x_opt[idx] = x_[idx]
-                dist = torch.dist(x_opt, self.x_ne)
-                L.append(dist.item())
-                print(f"Iter: {Iter:04d} | Dist: {dist.item():.4f}")
+                x_opt.clamp_(lb, ub)
+
+                if (Iter+1) % 50 == 0 or Iter == 0:
+                    dist = self.check_quality(x_opt.clamp(lb, ub))
+                    L.append(dist.item())
+                    print(f"Iter: {Iter+1:04d} | Dist: {dist.item():.4f}")
+                Iter += 1
                 
                 ## update
                 x_[idx], G[idx] = self.compute_G_(x_opt, idx)
                 for j in self.adjList[idx]:
                     x_[j], G[j] = self.compute_G_(x_opt, j)
+        
         return x_opt, L
 
-    
-    ## structural projection
-    ## given x^t at step t, this is to solve:
-    ## min_{z} || x^t - z ||_2
-    ##   s.t.   ||Cz - y||_2 \le epsilon
-    def structure_proj_(self, xt):
-        z = cvx.Variable(self.n)
-        obj = cvx.norm(z - xt.detach().numpy(), 2)
-        const = [cvx.norm(self.C @ z - self.y_at_ne, 2) <= self.proj_tol]
-        prob = cvx.Problem(cvx.Minimize(obj), const)
-        prob.solve()
-        return torch.tensor(z.value, dtype=DTYPE)
-
-
     ###########################################################################
+    def aggregate_group(self, x):
+        """
+            aggregate the individual-level action profile by averaging
+        """
+        return self.N @ self.M @ x
 
-    def grad_BR(self, maxIter=200, lr=0.01, x_init=None, elementwise=True, optimizer='Adam', projection=False):
-        if x_init != None:
+    def distribute_group(self, y):
+        """
+            distribute the group-level action profile back to the individual-level game
+        """
+        return (y[None, :] @ self.M).sum(axis=0)
+
+
+    def grad_BR(self, maxIter=100, lr=0.01, x_init=None, elementwise=True, optimizer='Adam', traj=False, proj=False):
+
+        if x_init is not None:
+            x_init = torch.tensor(x_init, dtype=DTYPE)
             x = nn.Parameter(x_init.clone(), requires_grad=True)
         else:
             x = nn.Parameter(torch.rand(self.n), requires_grad=True)
+    
+        L = []
+        dist = self.check_quality(x.detach())
+        L.append(dist.item())
         
         if optimizer == 'Adam':
             optimizer = optim.Adam([x], lr=lr)
@@ -215,35 +262,71 @@ class LQGame(Game):
             optimizer = optim.SGD([x], lr=lr)
         else:
             raise ValueError("Unknown optimizer in grad_BR")
-        # scheduler = optim.lr_scheduler.MultiplicativeLR(optimizer, lr_lambda=lambda epoch: 0.99)
+        # scheduler = optim.lr_scheduler.MultiplicativeLR(optimizer, lr_lambda=lambda epoch: 0.999)
+        # scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=15)
 
-        L = []
-        for epoch in range(maxIter):
+        for Iter in range(maxIter):
             optimizer.zero_grad()
             if elementwise:
-                loss = -self.utility(x)
+                loss = -self.utility(x) 
                 grad_ = torch.zeros(self.n)
                 for i in range(self.n):
                     x.grad = None
                     loss[i].backward(retain_graph=True)
                     grad_[i] = x.grad[i]
                 x.grad = grad_
+                # self.check_gradient(x.data, x.grad.data)
             else:
-                r = self.regret(x)
+                r = self.regret(x) 
                 loss = r.sum()
                 loss.backward()
 
             optimizer.step()
-            ## projection step
-            if projection:
-                x.data = self.structure_proj_(x)
+            # scheduler.step()
 
-            # torch.clamp(x, min=0, max=float('inf'))
-            dist = self.check_quality(x.detach())
-            L.append(dist.item())
-            # print(f"Epoch: {epoch:04d} | Dist: {dist.item():.4f}")
-        return x.detach(), L
+            ## make sure the action profile is in [0, 1]
+            x.data = x.data.clamp(0, 1)
+
+            ## projection with the help of the group-level game
+            if proj:
+                x.data = self.distribute_group(self.aggregate_group(x.data))
+
+            ## if we need the optimization trajectory
+            if traj:
+                dist = self.check_quality(x.detach())
+                L.append(dist.item())
+
+            ## if (Iter+1) % 50 == 0 or Iter == 0:
+            r = self.check_quality(x.detach())
+            print(f"Iter: {Iter+1:04d} | Regret: {r.item():.4f}")
+
+        if traj:
+            return (x.detach(), L)
+        else:
+            return x.detach()
 
     
+    ###########################################################################
+    
+
+    # ### the idea of SDP based on merit function
+    # ###########################################################################
+    # def merit_SDP(self):
+    #     K = torch.diag(self.beta * torch.ones(self.n)).numpy() @ self.adj.numpy() - \
+    #                         torch.eye(self.n).numpy()
+    #     Q_mat = cvx.bmat([[0.5 * (K + K.T), 0.5 * self.b.numpy()[:, None]], [0.5 * self.b.numpy()[:, None].T, np.matrix(0)]])
+    #     X_opt = cvx.Variable((self.n+1, self.n+1), symmetric=True)
+    #     x_opt = cvx.Variable(self.n, nonneg=True)
+
+    #     cons_1 = K @ x_opt + self.b.numpy()
+    #     x_hat = cvx.hstack([x_opt, 1])
+    #     cons_2 = cvx.bmat([[X_opt, x_hat[:, None]], [x_hat[:, None].T, np.matrix(1)]])
+
+    #     consts = [cons_1 >= 0, cons_2 >> 0, x_opt <= 5, X_opt <= 25]
+    #     obj = cvx.trace(Q_mat @ X_opt)
+    #     prob = cvx.Problem(cvx.Minimize(obj), consts)
+    #     prob.solve(solver=cvx.SCS, verbose=True)
+    #     return x_opt.value
+        
 
 
