@@ -296,9 +296,9 @@ class LQGame(Game):
                 dist = self.check_quality(x.detach())
                 L.append(dist.item())
 
-            ## if (Iter+1) % 50 == 0 or Iter == 0:
-            r = self.check_quality(x.detach())
-            print(f"Iter: {Iter+1:04d} | Regret: {r.item():.4f}")
+            if (Iter+1) % 10 == 0 or Iter == 0:
+                r = self.check_quality(x.detach())
+                print(f"Iter: {Iter+1:04d} | Regret: {r.item():.4f}")
 
         if traj:
             return (x.detach(), L)
@@ -328,5 +328,4 @@ class LQGame(Game):
     #     prob.solve(solver=cvx.SCS, verbose=True)
     #     return x_opt.value
         
-
 

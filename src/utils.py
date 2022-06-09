@@ -27,7 +27,7 @@ def extract_community(G):
     M = np.zeros((num_comms, n))
     for i in range(num_comms):
         M[i, list(comms_final[i])] = 1
-    return M
+    return M, comms_final
 
 
 
@@ -85,6 +85,10 @@ def gen_graph(n, graph, seed=123, ID=4, withinProb=0.2):
         G = nx.read_edgelist('../data/email-Eu-core-cc.txt', delimiter=' ', nodetype=int)
         mapping = {n: i for i, n in enumerate(list(G.nodes()))}
         G = nx.relabel_nodes(G, mapping)
+    elif graph == 'Youtube':
+        G = nx.read_edgelist('../data/com-youtube.ungraph.txt', nodetype=int)
+        mapping = {n: i for i, n in enumerate(list(G.nodes()))}
+        G = nx.relabel_nodes(G, mapping)
     elif graph == 'BTER':
         G = nx.read_edgelist(f'../data/BTER/BTER_{ID:02}.txt', delimiter=' ', nodetype=int)
     elif graph == 'SBM':
@@ -103,6 +107,8 @@ def gen_graph(n, graph, seed=123, ID=4, withinProb=0.2):
         G = nx.read_edgelist('../data/facebook_combined.txt', nodetype=int)
         mapping = {item: idx for idx, item in enumerate(G.nodes())}
         G = nx.relabel_nodes(G, mapping)
+
+    G.remove_edges_from(nx.selfloop_edges(G))
     return G
 
 
