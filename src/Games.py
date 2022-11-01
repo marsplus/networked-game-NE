@@ -1,211 +1,137 @@
-import torch
+import os
+import time
 import numpy as np
-from abc import ABC, abstractmethod
+import networkx as nx
+import dill as pickle
 
+import torch
 import torch.optim as optim
 import torch.nn as nn
 from torch.autograd import Variable
 
-import cvxpy as cvx
-
-DTYPE = torch.float32
-
-## abstract class for games
-class Game(ABC):
-    @abstractmethod
-    def __init__(self):
-        pass
-
-    @abstractmethod
-    def utility(self):
-        pass
-
-    @abstractmethod
-    def utility_(self):
-        pass
-
-    @abstractmethod
-    def check_quality(self):
-        pass
-
-    @abstractmethod
-    def approx_NE(self):
-        pass
+torch.set_default_dtype(torch.float32)
 
 
-class LQGame(Game):
-    def __init__(self, n, b_vec, adj, beta, M=None, N=None, lb=0.0, ub=1.0):
-        # sr = np.abs(np.linalg.eig(np.diag(beta * np.ones(n)) @ adj)[0]).max()
-        # ## whether the game has a unique NE
-        # self.unique_ne = True if sr < 1.0 else False
-
+class LQGame(object):
+    def __init__(self, n, G, b_vec=None, beta=None, lb=0.0, ub=1.0):
         self.lb = lb
         self.ub = ub
             
         self.n    = n
-        self.b    = torch.tensor(b_vec, dtype=DTYPE)
-        self.adj  = torch.tensor(adj, dtype=DTYPE)
-        ## make sure the diagonal items are zeros
-        self.adj -= torch.diag(torch.diag(self.adj))
-        self.beta = torch.tensor(beta, dtype=DTYPE)
+        self.b    = b_vec
+        self.beta = beta
 
-        ## compute Laplacian matrix
-        self.laplacian = torch.diag(self.adj.sum(axis=0)) - self.adj
+        # self.aggregator = lambda x: x
 
-        ## group membership information
-        if (M is not None) and (N is not None):
-            self.M = torch.tensor(M, dtype=DTYPE)
-            self.N = torch.tensor(N, dtype=DTYPE)
+        self.neigh_idx = {
+            i: list(G.neighbors(i)) for i in range(self.n)}  
 
-        # if self.unique_ne: 
-        #     self.x_ne  = self.approx_NE()
+
+    def neigh_total(self, x, i):
+        idx = self.neigh_idx[i]
+        return sum(x[idx])
+
+
+    ## compute individual gradient 
+    def grad_(self, x, i):
+        neigh_total = self.neigh_total(x, i)
+        g_          = self.b[i] - x[i] + self.beta[i] * neigh_total
+        return g_
+
+
+    ## compute total gradient (the objective function is the total regret)
+    def total_grad_(self, x, i):
+        neigh_total = self.neigh_total(x, i)
+        neigh_total_weighted = sum([self.beta[k] * x[k] for k in self.neigh_idx[i]])
+        g_          = self.b[i] - x[i] + self.beta[i] * neigh_total + neigh_total_weighted
+        return g_
+
+
+    def utility_(self, xi, ni, i):
+        return self.b[i] * xi - 0.5 * np.power(xi, 2) + self.beta[i] * xi * ni
 
         
-        self.adjList = {}
-        for i in range(self.n):
-            adjlist = torch.nonzero(self.adj[i, :]).squeeze().tolist() 
-            if type(adjlist) is list:
-                self.adjList[i] = adjlist
-            else:
-                self.adjList[i] = [adjlist]
+    ## output a single player's best response
+    def best_response_(self, x, i):
+        neigh_total = self.neigh_total(x, i)
+        x_opt       = np.clip(self.b[i] + self.beta[i] * neigh_total, self.lb, self.ub)
+        return x_opt
 
 
-    ## check the computation of gradients
-    def check_gradient(self, x, grad):
-        grad_true = self.b - x + torch.diag(self.beta * torch.ones(self.n)) @ ( self.adj @ x )
-        dist = torch.dist(torch.abs(grad_true), torch.abs(grad))
-        print(f"Gradient difference: {dist:.8f}")
-
-
-    ## output a vector of utilities
-    def utility(self, x):
-        u = self.b * x - 0.5 * x * x + torch.diag(self.beta * torch.ones(self.n)) @ x * (self.adj @ x)
-        return u
-
-    
-    ## output a single player's utility
-    def utility_(self, x, i):
-        beta = self.beta * torch.ones(self.n)
-        return self.b[i] * x[i] - 0.5 * x[i] ** 2 + beta[i] * x[i] * torch.dot(self.adj[i, :], x)
-
-
-    ## potential function
-    def potential(self, x):
-        Q = torch.eye(self.n) - torch.diag(self.beta * torch.ones(self.n)) @ self.adj
-        poten = torch.dot(self.b, x) - 0.5 * torch.dot(x, Q @ x)
-        return poten
-
-
-    ## approx. NE
-    def approx_NE(self):
-        beta = self.beta * torch.ones(self.n)
-        A    = torch.eye(self.n) - torch.diag(beta) @ self.adj
-        x_ne = torch.linalg.solve(A, self.b.reshape(-1, 1))
-        # x_ne, _ = torch.solve(self.b.reshape(-1, 1), A)
-        x_ne.clamp_(self.lb, self.ub)
-        return x_ne.squeeze()
-
-
-    ## compute gradient map
-    def compute_grad(self, xt):
-        beta = self.beta * torch.ones(self.n)
-        grad = self.b - xt + torch.diag(beta) @ self.adj @ xt
-        return grad
-
-
-    def check_quality(self, x):
-        # if self.unique_ne:
-        #     return torch.dist(self.x_ne, x)
-        # else:
-        return self.regret(x).max()
-
-
-    ## output a vector of regrets
+    ## output the regret of the current profile
     def regret(self, x):
-        r = torch.zeros(self.n)
+        reg = float('-inf')
         for i in range(self.n):
-            r[i] = self.regret_(x, i)
-        return r   
+            reg = max(self.regret_(x, i), reg)
+        return reg
 
 
     ## output a single player's regret
     def regret_(self, x, i):
-        x_opt = x.clone()
-        x_opt[i] = self.best_response_(x, i)
-        rt = self.utility_(x_opt, i) - self.utility_(x, i)    
-        assert(rt >= 0.0 or torch.abs(rt) <= 1e-5)
+        neigh_total = self.neigh_total(x, i)
+        x_best = self.best_response_(x, i)
+        rt = self.utility_(x_best, neigh_total, i) - self.utility_(x[i], neigh_total, i)
+        assert(rt >= 0.0 or np.abs(rt) <= 1e-5)
         return rt
 
 
-    ## output a vector of best responses
-    def best_response(self, x):
-        x_ = self.b + torch.diag(self.beta * torch.ones(self.n)) @ self.adj @ x
-        x_.clamp_(self.lb, self.ub)
-        return x_
-
-
-    ## output a single player's best response
-    def best_response_(self, x, i):
-        beta = self.beta * torch.ones(self.n)
-        x_ = self.b[i] + beta[i] * torch.dot(self.adj[i, :], x)
-        x_.clamp_(self.lb, self.ub)
-        return x_
-
-
-
-    ## Vickrey&Koller, AAAI02
     ###########################################################################
-    def compute_G_(self, x, i, nIter=3):
-        x_ = x.clone()
-        neigh_effect = torch.dot(self.adj[i, :], x_)
-        beta = self.beta * torch.ones(self.n)
-        r_old = self.regret(x_, lb=float('-inf'), ub=float('inf'))
 
-        ## temporarily used for differentiation
-        utility_ = lambda x_i, i, neffect: self.b[i] * x_i - 0.5 * x_i ** 2 + beta[i] * x_i * neffect
+    def grad_BR(self, maxIter=100, lr=0.01, x_init=None, full_update=True, elementwise=True, mode='sequential'):
+        x = x_init.copy() if x_init is not None else np.random.rand(self.n)
+        # x = x_init if x_init is not None else np.zeros(self.n)
 
-        ## compute i's best response
-        i_opt = self.b[i] + beta[i] * neigh_effect
-
-        y = Variable(torch.rand_like(x[i]), requires_grad=True)
-        optimizer = optim.LBFGS([y], lr=0.01, history_size=30, max_iter=15, line_search_fn="strong_wolfe")
-
-        ## the objective function to minimize
-        def f(y):
-            x_[i] = y
-            r_ = r_old.clone()
-            ## i's regret
-            r_[i] = utility_(i_opt, i, neigh_effect) - utility_(y, i, neigh_effect) 
-
-            ## i's neighbors regret
-            for j in self.adjList[i]:
-                n_effect = torch.dot(self.adj[j, :], x_)
-                j_opt = self.b[j] + beta[j] * n_effect
-                ## j's regret
-                r_[j] = utility_(j_opt, j, n_effect) - utility_(x_[j], j, n_effect)
+        L = []
+        for Iter in range(maxIter):
+            if (Iter + 1) % 10 == 0 or Iter == 0:
+                reg  = self.regret(x)
+                L.append(reg)
+                # print(f"Iter: {Iter+1} | reg: {reg}")    
             
-            return -(r_old.sum() - r_.sum())
-            
-        for _ in range(nIter):
-            optimizer.zero_grad()
-            obj = f(y)
-            obj.backward(retain_graph=True)
-            # print("obj: ", obj.item())
-            optimizer.step(lambda: f(y))
+            if full_update:
+                idx = range(self.n)
+            else:
+                idx = np.random.choice(range(self.n), size=int(self.n * 0.1), replace=False)
 
-        return y.item(), -f(y).item()
+            x_tmp = x.copy()
+            for i in idx:
+                ### whether to update elementwise
+                if elementwise:
+                    grad_ = self.grad_(x, i)
+                else:
+                    grad_ = self.total_grad_(x, i)
+                
+                if mode != 'sequential':
+                    x_tmp[i] = x[i] + lr * grad_
+                    x_tmp[i] = np.clip(x_tmp[i], self.lb, self.ub)
+                else:
+                    x[i] = x[i] + lr * grad_
+                    x[i] = np.clip(x[i], self.lb, self.ub)
+            if mode != 'sequential':
+                x = x_tmp
+        
+        return (x, L)
 
 
-    def regretMIN(self, x, maxIter=1500, lb=0, ub=1):
+    ###########################################################################
+    ### Vickrey & Koller, AAAI02 ###
+    def regretMIN(self, x_init=None, maxIter=1500):
+        if x_init is None:
+            x_init = np.random.rand(self.n)
+
+        b_tensor = torch.tensor(self.b)
+        beta_tensor = torch.tensor(self.beta)
+
         ## initialize the G vector
-        G  = torch.zeros(self.n)
-        x_ = torch.zeros(self.n)
+        G = torch.zeros(self.n)
+        x_tmp = torch.zeros(self.n)
         for i in range(self.n):
-            x_[i], G[i] = self.compute_G_(x, i)
+            x_tmp[i], G[i] = self.compute_G(x_init, i, b_tensor, beta_tensor)
             
-        x_opt = x.clone()
+
+        x_opt = torch.tensor(x_init)
         Iter = 0
-        L = [self.check_quality(x_opt)]
+        L = [self.regret(x_init)]
         while True:
             if Iter >= maxIter:
                 break
@@ -214,118 +140,247 @@ class LQGame(Game):
             if G[idx] <= 0:
                 break
             else:
-                x_opt[idx] = x_[idx]
-                x_opt.clamp_(lb, ub)
+                x_opt[idx] = x_tmp[idx]
 
-                if (Iter+1) % 50 == 0 or Iter == 0:
-                    dist = self.check_quality(x_opt.clamp(lb, ub))
-                    L.append(dist.item())
-                    print(f"Iter: {Iter+1:04d} | Dist: {dist.item():.4f}")
+                if (Iter+1) % 10 == 0 or Iter == 0:
+                    reg = self.regret(x_opt.numpy())
+                    L.append(reg)
+                    # print(f"Iter: {Iter+1:04d} | Reg: {reg:.4f}")
                 Iter += 1
                 
                 ## update
-                x_[idx], G[idx] = self.compute_G_(x_opt, idx)
-                for j in self.adjList[idx]:
-                    x_[j], G[j] = self.compute_G_(x_opt, j)
+                for j in self.neigh_idx[idx] + [idx]:
+                    x_tmp[j], G[j] = self.compute_G(x_opt, j, b_tensor, beta_tensor)
         
-        return x_opt, L
-
-    ###########################################################################
-    def aggregate_group(self, x):
-        """
-            aggregate the individual-level action profile by averaging
-        """
-        return self.N @ self.M @ x
-
-    def distribute_group(self, y):
-        """
-            distribute the group-level action profile back to the individual-level game
-        """
-        return (y[None, :] @ self.M).sum(axis=0)
+        return x_opt.numpy(), L
 
 
-    def grad_BR(self, maxIter=100, lr=0.01, x_init=None, elementwise=True, optimizer='Adam', traj=False, proj=False):
+    def compute_G(self, x, i, b_tensor, beta_tensor, nIter=3):
+        x_tmp = torch.tensor(x)
+        S_old = torch.tensor(sum([self.regret_(x, k) for k in self.neigh_idx[i] + [i]]))
 
-        if x_init is not None:
-            x_init = torch.tensor(x_init, dtype=DTYPE)
-            x = nn.Parameter(x_init.clone(), requires_grad=True)
-        else:
-            x = nn.Parameter(torch.rand(self.n), requires_grad=True)
-    
-        L = []
-        dist = self.check_quality(x.detach())
-        L.append(dist.item())
+        ## temporarily used for differentiation
+        utility_ = lambda x_i, i, ni: \
+            b_tensor[i] * x_i - 0.5 * x_i ** 2 + beta_tensor[i] * x_i * ni
         
-        if optimizer == 'Adam':
-            optimizer = optim.Adam([x], lr=lr)
-        elif optimizer == 'SGD':
-            optimizer = optim.SGD([x], lr=lr)
-        else:
-            raise ValueError("Unknown optimizer in grad_BR")
-        # scheduler = optim.lr_scheduler.MultiplicativeLR(optimizer, lr_lambda=lambda epoch: 0.999)
-        # scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=15)
+        y = Variable(torch.rand_like(x_tmp[i]), requires_grad=True)        
+        optimizer = optim.LBFGS([y], lr=0.01, history_size=100, max_iter=30, line_search_fn="strong_wolfe")
 
-        for Iter in range(maxIter):
+        ## the objective function to minimize
+        def f(y):
+            x_tmp[i] = y
+            S_new = 0.0
+
+            for j in self.neigh_idx[i] + [i]:
+                nj = self.neigh_total(x_tmp, j)
+                xj_best = torch.clamp(b_tensor[j] + beta_tensor[j] * nj, min=self.lb, max=self.ub)
+                S_new += utility_(xj_best, j, nj) - utility_(x_tmp[j], j, nj)
+            return -(S_old - S_new)
+
+        for _ in range(nIter):
             optimizer.zero_grad()
-            if elementwise:
-                loss = -self.utility(x) 
-                grad_ = torch.zeros(self.n)
-                for i in range(self.n):
-                    x.grad = None
-                    loss[i].backward(retain_graph=True)
-                    grad_[i] = x.grad[i]
-                x.grad = grad_
-                # self.check_gradient(x.data, x.grad.data)
-            else:
-                r = self.regret(x) 
-                loss = r.sum()
-                loss.backward()
-
-            optimizer.step()
-            # scheduler.step()
-
-            ## make sure the action profile is in [0, 1]
-            x.data = x.data.clamp(0, 1)
-
-            ## projection with the help of the group-level game
-            if proj:
-                x.data = self.distribute_group(self.aggregate_group(x.data))
-
-            ## if we need the optimization trajectory
-            if traj:
-                dist = self.check_quality(x.detach())
-                L.append(dist.item())
-
-            if (Iter+1) % 10 == 0 or Iter == 0:
-                r = self.check_quality(x.detach())
-                print(f"Iter: {Iter+1:04d} | Regret: {r.item():.4f}")
-
-        if traj:
-            return (x.detach(), L)
-        else:
-            return x.detach()
-
-    
-    ###########################################################################
-    
-
-    # ### the idea of SDP based on merit function
-    # ###########################################################################
-    # def merit_SDP(self):
-    #     K = torch.diag(self.beta * torch.ones(self.n)).numpy() @ self.adj.numpy() - \
-    #                         torch.eye(self.n).numpy()
-    #     Q_mat = cvx.bmat([[0.5 * (K + K.T), 0.5 * self.b.numpy()[:, None]], [0.5 * self.b.numpy()[:, None].T, np.matrix(0)]])
-    #     X_opt = cvx.Variable((self.n+1, self.n+1), symmetric=True)
-    #     x_opt = cvx.Variable(self.n, nonneg=True)
-
-    #     cons_1 = K @ x_opt + self.b.numpy()
-    #     x_hat = cvx.hstack([x_opt, 1])
-    #     cons_2 = cvx.bmat([[X_opt, x_hat[:, None]], [x_hat[:, None].T, np.matrix(1)]])
-
-    #     consts = [cons_1 >= 0, cons_2 >> 0, x_opt <= 5, X_opt <= 25]
-    #     obj = cvx.trace(Q_mat @ X_opt)
-    #     prob = cvx.Problem(cvx.Minimize(obj), consts)
-    #     prob.solve(solver=cvx.SCS, verbose=True)
-    #     return x_opt.value
+            obj = f(y)
+            obj.backward(retain_graph=True)
+            optimizer.step(lambda: f(y))
         
+        with torch.no_grad():
+            y.clamp_(min=self.lb, max=self.ub)
+            return y.detach(), -f(y).detach()
+
+
+###########################################################################
+
+
+class Bestshot(object):
+    def __init__(self, n, G, b_vec=None, beta=None, lb=0.0, ub=1.0):
+        self.n = n
+        self.c = b_vec 
+        self.lb = 0.0
+        self.ub = 1.0
+        self.neigh_idx = {
+            i: list(G.neighbors(i)) for i in range(self.n)
+            } 
+
+
+    def neigh_total(self, x, i):
+        return np.prod(1 - x[self.neigh_idx[i]])
+
+
+    ## compute individual gradient 
+    def grad_(self, x, i):
+        neigh_total = self.neigh_total(x, i)
+        return neigh_total - self.c[i]
+
+
+    def utility_(self, xi, ni, i):
+        return 1 + (xi - 1) * ni - self.c[i] * xi
+
+        
+    ## output a single player's best response
+    def best_response_(self, x, i):
+        neigh_total = self.neigh_total(x, i)
+        if neigh_total - self.c[i] >= 0:
+            return 1.0
+        else:
+            return 0.0
+
+    ## the social welfare of an action profile
+    def sw(self, x):
+        s = 0.
+        for i in range(self.n):
+            ni = self.neigh_total(x, i)
+            s += self.utility_(x[i], ni, i)
+        return s
+
+
+    ## output the regret of the current profile
+    def regret(self, x):
+        reg = float('-inf')
+        for i in range(self.n):
+            reg = max(self.regret_(x, i), reg)
+        return reg
+
+
+    ## output a single player's regret
+    def regret_(self, x, i):
+        neigh_total = self.neigh_total(x, i)
+        x_best = self.best_response_(x, i)
+        rt = self.utility_(x_best, neigh_total, i) - self.utility_(x[i], neigh_total, i)
+        # assert(rt >= 0.0 or np.abs(rt) <= 1e-5)
+        return rt
+
+
+    def grad_BR(self, maxIter=100, lr=0.01, x_init=None, full_update=True, elementwise=True, mode='sequential'):
+        x = x_init.copy() if x_init is not None else np.random.rand(self.n)
+
+        L = []
+        for Iter in range(maxIter):
+            if (Iter + 1) % 10 == 0 or Iter == 0:
+                x_tmp = x.copy()
+                x_tmp[x_tmp >= 0.5] = 1
+                x_tmp[x_tmp < 0.5]  = 0
+                reg  = self.regret(x_tmp)
+                L.append(reg)
+                # print(f"Iter: {Iter+1} | reg: {reg}")    
+            
+            if full_update:
+                idx = range(self.n)
+            else:
+                idx = np.random.choice(range(self.n), size=int(self.n * 0.1), replace=False)
+
+            x_tmp = x.copy()
+            for i in idx:
+                ### whether to update elementwise
+                if elementwise:
+                    grad_ = self.grad_(x, i)
+                else:
+                    grad_ = self.total_grad_(x, i)
+                
+                if mode != 'sequential':
+                    x_tmp[i] = x[i] + lr * grad_
+                    x_tmp[i] = np.clip(x_tmp[i], self.lb, self.ub)
+                else:
+                    x[i] = x[i] + lr * grad_
+                    x[i] = np.clip(x[i], self.lb, self.ub)
+            if mode != 'sequential':
+                x = x_tmp
+
+        x[x >= 0.5] = 1
+        x[x < 0.5]  = 0
+        return (x, L)
+
+
+
+class BHGame(object):
+    def __init__(self, n, G, b_vec=None, beta=None, lb=0.0, ub=1.0):
+        self.lb = lb
+        self.ub = ub            
+        self.n  = n
+        self.eps = 1e-5
+
+        self.neigh_idx = {
+            i: list(G.neighbors(i)) for i in range(self.n)}  
+
+
+    def neigh_total(self, x, i):
+        idx = self.neigh_idx[i]
+        return sum(x[idx])
+
+
+    ## compute individual gradient 
+    def grad_(self, x, i):
+        neigh_total = self.neigh_total(x, i)
+        num_neighbor = len(self.neigh_idx[i])
+        g = -2 * (x[i] - neigh_total / max(num_neighbor, self.eps))
+        return g
+
+
+    def utility_(self, xi, ni, i):
+        num_neighbor = len(self.neigh_idx[i])
+        return -1 * np.power(xi - ni / max(num_neighbor, self.eps), 2)
+
+        
+    ## output a single player's best response
+    def best_response_(self, x, i):
+        neigh_total = self.neigh_total(x, i)
+        num_neighbor = len(self.neigh_idx[i])
+        x_opt       = np.clip(neigh_total / max(num_neighbor, self.eps), self.lb, self.ub)
+        return x_opt
+
+
+    ## output the regret of the current profile
+    def regret(self, x):
+        reg = float('-inf')
+        for i in range(self.n):
+            reg = max(self.regret_(x, i), reg)
+        return reg
+
+
+    ## output a single player's regret
+    def regret_(self, x, i):
+        neigh_total = self.neigh_total(x, i)
+        x_best = self.best_response_(x, i)
+        rt = self.utility_(x_best, neigh_total, i) - self.utility_(x[i], neigh_total, i)
+        assert(rt >= 0.0 or np.abs(rt) <= 1e-5)
+        return rt
+
+
+    ###########################################################################
+
+    def grad_BR(self, maxIter=100, lr=0.01, x_init=None, full_update=True, elementwise=True, mode='sequential'):
+        x = x_init.copy() if x_init is not None else np.random.rand(self.n)
+        # x = x_init if x_init is not None else np.zeros(self.n)
+
+        L = []
+        for Iter in range(maxIter):
+            if (Iter + 1) % 10 == 0 or Iter == 0:
+                reg  = self.regret(x)
+                L.append(reg)
+                # print(f"Iter: {Iter+1} | reg: {reg}")    
+            
+            if full_update:
+                idx = range(self.n)
+            else:
+                idx = np.random.choice(range(self.n), size=int(self.n * 0.1), replace=False)
+
+            x_tmp = x.copy()
+            for i in idx:
+                ### whether to update elementwise
+                if elementwise:
+                    grad_ = self.grad_(x, i)
+                else:
+                    grad_ = self.total_grad_(x, i)
+                
+                if mode != 'sequential':
+                    x_tmp[i] = x[i] + lr * grad_
+                    x_tmp[i] = np.clip(x_tmp[i], self.lb, self.ub)
+                else:
+                    x[i] = x[i] + lr * grad_
+                    x[i] = np.clip(x[i], self.lb, self.ub)
+            if mode != 'sequential':
+                x = x_tmp
+        
+        return (x, L)
+
+
 

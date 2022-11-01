@@ -66,6 +66,13 @@ def aggregate_individualLevel(M, N, x, mode='mean'):
     return ret
 
 
+def getM(G, comms):
+    n  = len(G)
+    nG = len(comms) 
+    M = np.zeros((nG, n))
+    for k, com in comms.items():
+        M[k, com] = 1
+    return M
 
 
 
@@ -74,11 +81,10 @@ if __name__ == '__main__':
     parser.add_argument('--maxIter',       type=int,   default=200)
     parser.add_argument('--lr',            type=float, default=0.1)
     parser.add_argument('--n',             type=int,   default=910)
-    parser.add_argument('--graph',         type=str,   default='Email')
+    parser.add_argument('--graph',         type=str,   default='Facebook')
     parser.add_argument('--elem',          type=int,   default=1)
     parser.add_argument('--b_mode',        type=str,   default='uniform')
-    parser.add_argument('--beta_mode',     type=str,   default='gaussian')
-    parser.add_argument('--comple',        type=int,   default=1, help='strategic complementarity?')
+    parser.add_argument('--beta_mode',     type=str,   default='fully-homophily')
     parser.add_argument('--proj',          type=int,   default=0, help='whether to do projection')
     parser.add_argument('--traj',          type=int,   default=1, help='whether to collect trajectories')
     parser.add_argument('--b_var',         type=float, default=0.1)
@@ -88,9 +94,11 @@ if __name__ == '__main__':
     parser.add_argument('--withinProb',    type=float, default=0.2)
     parser.add_argument('--theta',         type=float, default=0.85, help='a threshold to zero out group-level edges.')
     parser.add_argument('--fPath',         type=str,   default='../result/tmp.txt')
+    parser.add_argument('--opt',           type=str,   default='Adam')
     args  = parser.parse_args()
     DTYPE = torch.float32
     np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
     UB = 1.0
 
 
@@ -98,12 +106,13 @@ if __name__ == '__main__':
     G        = gen_graph(args.n, args.graph, ID=args.seed, withinProb=args.withinProb)
     n        = len(G)    
     ### the aggregation specifics
-    M, comms = extract_community(G)
+    comms    = extract_community(G, graph=args.graph)
+    M        = getM(G, comms)
     N        = np.diag(1 / M.sum(axis=1))       
     b_var    = args.b_var 
-    b_vec    = gen_b(   G, b_var,    M, mode=args.b_mode)                                    ### marginal benefits vector
+    b_vec    = gen_b(G, b_var, comms, mode=args.b_mode)                                    ### marginal benefits vector
     beta_var = args.beta_var
-    pe_vec   = gen_beta(G, beta_var, M, mode=args.beta_mode, comple=args.comple)             ### peer effects vector
+    pe_vec   = gen_beta(G, beta_var, comms, mode=args.beta_mode)
     adj      = np.array(nx.adjacency_matrix(G).todense())                                       ### individual-level adjacency matrix
     ind_game = LQGame(n, b_vec, adj, pe_vec, M=M, N=N, ub=UB)
 
@@ -111,7 +120,7 @@ if __name__ == '__main__':
 
     ### the group specifics
     nG          = len(N)
-    GG          = gen_group_graph(nG, args.theta, M, adj)
+    GG          = gen_group_graph(G, comms)
     adjG        = np.array(nx.adjacency_matrix(GG).todense())                    ### the adj. matrix of the groups
     bG_vec      = aggregate_individualLevel(M, N, b_vec, mode='mean')
     # beta_var_g  = args.beta_var_g
@@ -123,11 +132,11 @@ if __name__ == '__main__':
 
     ### compare y_hat and y_ne
     if args.traj:
-        x_ne, L_ne = ind_game.grad_BR(maxIter=args.maxIter, traj=args.traj, proj=args.proj, lr=args.lr)
+        x_ne, L_ne = ind_game.grad_BR(maxIter=args.maxIter, traj=args.traj, proj=args.proj, lr=args.lr, optimizer=args.opt)
     else:
-        x_ne       = ind_game.grad_BR(maxIter=args.maxIter, traj=args.traj, proj=args.proj)
+        x_ne       = ind_game.grad_BR(maxIter=args.maxIter, traj=args.traj, proj=args.proj, optimizer=args.opt)
     y_hat          = N @ M @ x_ne.numpy()
-    y_ne           = group_game.grad_BR(traj=False, proj=False) 
+    y_ne           = group_game.grad_BR(traj=False, proj=False, optimizer=args.opt) 
 
     y_hat_quality = group_game.check_quality(torch.tensor(y_hat, dtype=DTYPE))
     y_ne_quality  = group_game.check_quality(y_ne)

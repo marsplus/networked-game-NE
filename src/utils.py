@@ -1,6 +1,7 @@
 import numpy as np
 import networkx as nx
-import scipy.sparse as sp
+
+# import pymetis
 
 import torch
 from torch.autograd import Variable
@@ -10,25 +11,39 @@ from sklearn.cluster import KMeans
 from networkx.algorithms.community import greedy_modularity_communities, label_propagation_communities
 
 
-## extract community information into a matrix M
-## nonzero entries in the i-th row of M encode 
-## these players in community i
-def extract_community(G):
-    min_comm = np.floor(len(G) * 0.005)
-    comms = [list(c) for c in greedy_modularity_communities(G)]
-    if any([len(c) <= min_comm for c in comms]):
-        ### the 2nd term is to combine all agents in the communities with size less than min_comm 
-        ### into a single community
-        comms_final = [c for c in comms if len(c) > min_comm] + [[i for c in [L for L in comms if len(L) < min_comm] for i in c]]
+## extract community information
+def extract_community(G, graph, nComm=500):
+    if graph != 'Youtube':
+        min_comm = np.floor(len(G) * 0.005)
+        comms = [list(c) for c in greedy_modularity_communities(G)]
+        if any([len(c) <= min_comm for c in comms]):
+            ### the 2nd term is to combine all agents in the communities with size less than min_comm 
+            ### into a single community
+            comms_final = [c for c in comms if len(c) > min_comm] + \
+                          [[i for c in [L for L in comms if len(L) < min_comm] for i in c]]
+        else:
+            comms_final = comms
+        comms = {i: comms_final[i] for i in range(len(comms_final))}
     else:
-        comms_final = comms
-    num_comms = len(comms_final)
-    n = len(G)
-    M = np.zeros((num_comms, n))
-    for i in range(num_comms):
-        M[i, list(comms_final[i])] = 1
-    return M, comms_final
+        numComm = nComm
+        adjList = [np.array(list(G.neighbors(i))) for i in range(len(G))]
+        _, membership = pymetis.part_graph(numComm, adjacency=adjList)
+        comms = {i: np.argwhere(np.array(membership) == i).ravel() for i in range(numComm)}
+    return comms
 
+
+### generate random communities that have nothing to do
+### with the underlying network structure
+def random_community(G, comms):
+    n = len(G)
+    avai = list(range(n))
+    random_comms = {}
+    np.random.shuffle(avai)
+    for com in comms.keys():
+        comm_size = len(comms[com])
+        random_comms[com] = avai[:comm_size]
+        avai = avai[comm_size:]
+    return random_comms
 
 
 ### extract community information based on spectral clustering
@@ -69,16 +84,16 @@ def extract_community_spectralClustering(G, K, *param):
     return M
 
 
-def gen_graph(n, graph, seed=123, ID=4, withinProb=0.2):
+def gen_graph(n=100, graph='BTER', seed=12, withinProb=0.2):
     """
         Generate individual-level graph
     """
     if graph == 'BA':
-        G = nx.barabasi_albert_graph(n, 3, seed=seed)
+        G = nx.barabasi_albert_graph(n, 2, seed=seed)
     elif graph == 'ER':
-        G = nx.gnm_random_graph(n, n*(n-1)*0.02/2)
+        G = nx.gnm_random_graph(n, n*(n-1)*0.2/2, seed=seed)
     elif graph == 'SW':
-        G = nx.watts_strogatz_graph(n, 10, 0.2, seed=seed)
+        G = nx.watts_strogatz_graph(n, 2, 0.1, seed=seed)
     elif graph == 'RG':
         G = nx.random_geometric_graph(n, 0.4, seed=seed)
     elif graph == 'Email':
@@ -86,14 +101,12 @@ def gen_graph(n, graph, seed=123, ID=4, withinProb=0.2):
         mapping = {n: i for i, n in enumerate(list(G.nodes()))}
         G = nx.relabel_nodes(G, mapping)
     elif graph == 'Youtube':
-        G = nx.read_edgelist('../data/com-youtube.ungraph.txt', nodetype=int)
-        mapping = {n: i for i, n in enumerate(list(G.nodes()))}
-        G = nx.relabel_nodes(G, mapping)
+        G = nx.read_edgelist('../data/YouTube-processed/youtube-processed-graph.txt', nodetype=int)
     elif graph == 'BTER':
-        G = nx.read_edgelist(f'../data/BTER/BTER_{ID:02}.txt', delimiter=' ', nodetype=int)
+        G = nx.read_edgelist(f'../data/BTER/BTER_{seed:02}.txt', delimiter=' ', nodetype=int)
     elif graph == 'SBM':
         ## simulate a stochastic-block model
-        sizes    = [150, 100, 100, 80, 80, 120, 120, 50, 50, 30, 30]
+        sizes    = [100, 100, 80, 80, 50, 50, 30, 30]
         # off_prob = 0.001
         off_prob = 0.01
         in_prob  = lambda: np.random.uniform(withinProb-0.05, withinProb+0.05)
@@ -113,47 +126,67 @@ def gen_graph(n, graph, seed=123, ID=4, withinProb=0.2):
 
 
 
-def gen_group_graph(nG, theta, M, adj, eps=1e-5):
+def gen_group_graph(G, comms, eps=1e-7):
     """
         Generate a group-level graph that somehow reflects the individual-level
         connectivity.
     """
-    # assert(0 <= theta <= 1)
+    nG = len(comms)
 
-    # adjG   = M @ adj @ M.T          ### adjG[i, j]: the totoal number of connections from group i to group j
-    # adjG   = np.diag(1 / (np.diag(adjG) + eps)) @ adjG
-    # adjG  -= np.diag(np.diag(adjG)) ### zero out the diagonal entries
+    withinGroupConn = {}
+    for c in comms.keys():
+        withinGroupConn[c] = len(G.subgraph(comms[c]).edges())
+    
+    cnt = 0
+    total = 0
+    adjG = np.zeros((nG, nG))
+    for i in range(nG):
+        for j in range(i+1, nG):
+            numConn = nx.cut_size(G, comms[i], comms[j])
+            try:
+                adjG[i, j] = numConn / (withinGroupConn[i] * withinGroupConn[j])
+            except:
+                adjG[i, j] = 1.0
+            cnt += 1
+            total += adjG[i, j]
+    avgConn = total  / cnt
+    adjG = adjG + adjG.T
 
-    # for k in range(nG):
-    #     ### th: the threshold to determine if there is an edge between two groups
-    #     th         = np.quantile(adjG[k, :], theta)
-    #     idx_one    = np.nonzero(adjG[k, :] >= th)[0] 
-    #     idx_zero   = np.nonzero(adjG[k, :] <  th)[0] 
-    #     adjG[k, :][idx_one]  = 1
-    #     adjG[k, :][idx_zero] = 0
+    adjG[adjG >  avgConn] = 1
+    adjG[adjG <= avgConn] = 0
+    return nx.from_numpy_matrix(adjG)
+
+
+    # M = np.zeros((nG, n))
+    # for k, com in comms.items():
+    #     M[k, com] = 1
+    # adj = np.array(nx.adjacency_matrix(G).todense()) 
+
+    # adjG = M @ adj @ M.T
+    # adjG = np.diag(1 / (np.diag(adjG) + eps)) @ adjG @ np.diag(1 / (np.diag(adjG) + eps))
+    # # adjG /= adjG.max()
+    # adjG -= np.diag(np.diag(adjG))
+    # adjG[adjG > adjG.mean()] = 1
+    # adjG[adjG <= adjG.mean()] = 0
+    # return nx.from_numpy_matrix(adjG)
+    
+    # adjG = M @ adj @ M.T
+    # adjG /= adjG.max()
+    # adjG -= np.diag(np.diag(adjG))
     # return nx.from_numpy_matrix(adjG)
 
-    adjG = M @ adj @ M.T
-    adjG = np.diag(1 / (np.diag(adjG) + eps)) @ adjG @ np.diag(1 / (np.diag(adjG) + eps))
-    adjG -= np.diag(np.diag(adjG))
-    adjG[adjG > adjG.mean()] = 1
-    adjG[adjG <= adjG.mean()] = 0
-    return nx.from_numpy_matrix(adjG)
 
     
 
 
-
-def gen_beta(G, var, M=None, mode=None, comple=True):
+def gen_beta(G, var, comms, mode=None, control_var=0.001):
     n = len(G)
-    # if mode == 'gaussian':
-    #     beta = np.random.multivariate_normal(mean=np.zeros(n), cov=var*np.identity(n))
-    if mode in ['homophily', 'fully-homophily', 'gaussian']:
-        num_comm = M.shape[0]
+    if mode in ['homophily', 'fully-homophily', 'gaussian', 'control-homophily']:
+        num_comm = len(comms)
         beta = np.zeros(n)
         for k in range(num_comm):        
             ## generate induced subgraph for each comm.
-            idx = np.nonzero(M[k, :])[0]
+            idx = comms[k]
             n_sub = len(idx)
             subgraph = G.subgraph(idx)
             adj_sub = np.array(nx.adjacency_matrix(subgraph).todense())
@@ -163,22 +196,14 @@ def gen_beta(G, var, M=None, mode=None, comple=True):
                 beta_sub = np.random.multivariate_normal(mean=np.zeros(n_sub), cov=np.diag(np.diag(lap_sub_inv)))
             elif mode == 'homophily':
                 beta_sub = np.random.multivariate_normal(mean=np.zeros(n_sub), cov=lap_sub_inv)
+            elif mode == 'control-homophily':
+                s = np.mean(np.diag(lap_sub_inv))
+                m = np.random.normal(scale=np.sqrt(s)) * np.ones(n_sub)
+                beta_sub = np.random.multivariate_normal(mean=m, cov=control_var*np.eye(n_sub))    
             else:
                 s = np.mean(np.diag(lap_sub_inv))
-                beta_sub  = np.random.normal(scale=s) * np.ones(n_sub)
+                beta_sub  = np.random.normal(scale=np.sqrt(s)) * np.ones(n_sub)
             beta[idx] = beta_sub
-    elif mode == 'identical':
-        ### strategic complementarity 
-        factor_ = 1 if comple else -1
-        beta = factor_ * np.random.uniform() * np.ones(n)
-    elif mode in ['global-homophily', 'global-gaussian']:
-        adj      = np.array(nx.adjacency_matrix(G).todense())
-        lap      = np.diag(adj.sum(axis=1)) - adj
-        lap_inv  = np.linalg.pinv(lap, hermitian=True)
-        if mode == 'global-gaussian':
-            beta = np.random.multivariate_normal(mean=np.zeros(n), cov=np.diag(np.diag(lap_inv)))
-        else:
-            beta = np.random.multivariate_normal(mean=np.zeros(n), cov=lap_inv)
     elif mode == 'uniform':
         beta = np.random.rand(n)
     return beta
@@ -186,17 +211,14 @@ def gen_beta(G, var, M=None, mode=None, comple=True):
 
 
 ## generate the b vector in linear-quadratic games
-def gen_b(G, var, M=None, mode=None):
+def gen_b(G, var, comms, mode=None):
     n = len(G)
-    ## no homophily
-    # if mode == 'gaussian':
-    #     b_vec = np.random.multivariate_normal(np.zeros(n), var*np.identity(n))
     if mode in ['homophily', 'fully-homophily', 'gaussian']:
-        num_comm = M.shape[0]
+        num_comm = len(comms)
         b_vec = np.zeros(n)
         for k in range(num_comm):
             ## generate induced subgraph for each comm.
-            idx = np.nonzero(M[k, :])[0]
+            idx = comms[k]
             n_sub = len(idx)
             subgraph = G.subgraph(idx)
             adj_sub = np.array(nx.adjacency_matrix(subgraph).todense())
@@ -207,18 +229,13 @@ def gen_b(G, var, M=None, mode=None):
             elif mode == 'homophily':
                 b_sub = np.random.multivariate_normal(mean=np.zeros(n_sub), cov=lap_sub_inv) 
             else:
-                b_sub  = np.random.uniform() * np.ones(n_sub)
+                s = np.mean(np.diag(lap_sub_inv))
+                b_sub  = np.random.normal(scale=np.sqrt(s)) * np.ones(n_sub)
             b_vec[idx] = b_sub
-    elif mode == 'identical':
-        b_vec = np.random.uniform() * np.ones(n)
-    elif mode == 'global-homophily':
-        adj     = np.array(nx.adjacency_matrix(G).todense())
-        lap     = np.diag(adj.sum(axis=1)) - adj
-        lap_inv = np.linalg.pinv(lap, hermitian=True)
-        b_vec   = np.random.multivariate_normal(mean=np.zeros(n), cov=lap_inv)
     elif mode == 'uniform':
         b_vec = np.random.rand(n)
     return b_vec
+
 
 
 ### compute cosine similarity
